@@ -4,6 +4,15 @@ This project prices per-claim excess-of-loss (XoL) reinsurance using five years 
 
 The question I wanted to explore was: how does changing an XoL layer alter the insurer's retention, the reinsurer's expected recovery and the risk reflected in the technical premium?
 
+## Model specification at a glance
+
+- **Frequency:** exposure-adjusted Negative Binomial claim counts.
+- **Severity:** empirical resampling up to the 95th percentile, with a fitted Generalized Pareto tail above it.
+- **Pricing:** 5% of expected recovery for expenses, plus 25% of simulated standard deviation as a risk load.
+- **Simulation:** 10,000 years using seed 42 and a batch size of 500.
+
+The saved tables and figures were regenerated using this specification.
+
 ## Key results
 
 | Layer | Historical burning cost | Simulated expected recovery | CV | 95th percentile | Technical premium |
@@ -77,13 +86,20 @@ Frequency and severity are simulated independently. This is a simplifying assump
 
 ### 6. Technical premium
 
-For this project:
+The pricing function is:
+
+```text
+technical premium = expected recovery × (1 + expense loading)
+                  + volatility factor × simulation standard deviation
+```
+
+For the parameters used in this project, this becomes:
 
 ```text
 technical premium = expected recovery × 1.05 + 0.25 × simulation standard deviation
 ```
 
-The first term includes a 5% expense allowance. The second is a simple standard-deviation risk load, so more volatile layers receive a larger loading. It is still an illustrative pricing principle and not a substitute for a full capital model or commercial judgement.
+The 5% term is an expense allowance. The standard-deviation term is a simple risk load, so more volatile layers receive a larger loading. It is still an illustrative pricing principle and not a substitute for a full capital model or commercial judgement.
 
 I also tested 16 attachment-and-limit combinations to show how price and volatility respond as the reinsurer takes more or less of the tail.
 
@@ -118,7 +134,7 @@ The raw source CSVs are not committed. `data/README.md` records their source, ex
 
 ## Running the project
 
-Use Python 3.10 or later.
+Use Python 3.11 or later. The published results were generated with Python 3.12.13 and the exact dependency versions in `requirements.txt`.
 
 1. Download the two source CSVs described in `data/README.md` and place them in `data/`.
 2. Install the dependencies:
