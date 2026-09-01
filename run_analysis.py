@@ -1,4 +1,6 @@
-"""Run the full excess-of-loss pricing analysis and save tables and figures."""
+"""Run the excess-of-loss pricing analysis and save its outputs."""
+
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -6,12 +8,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy.stats import genpareto
 
 from src.xol_pricing_engine import (
     DEFAULT_LAYERS,
+    SeverityModel,
+    XoLLayer,
     fit_frequency_model,
+    fit_severity_model,
     historical_burning_costs,
-    layer_recovery,
     load_data,
     sensitivity_table,
     simulate_annual_claim_counts,
@@ -21,84 +26,98 @@ from src.xol_pricing_engine import (
 )
 
 
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+FIGURE_DIR = ROOT / "outputs" / "figures"
+TABLE_DIR = ROOT / "outputs" / "tables"
+
 SEED = 42
 SIMULATIONS = 10_000
-PREMIUM_LOADING = 0.20
+BATCH_SIZE = 500
+TAIL_THRESHOLD_QUANTILE = 0.95
+EXPENSE_LOADING = 0.05
+VOLATILITY_FACTOR = 0.25
+
+SENSITIVITY_ATTACHMENTS = (50_000, 100_000, 250_000, 500_000)
+SENSITIVITY_LIMITS = (100_000, 250_000, 500_000, 1_000_000)
 
 
-def currency_axis(axis) -> None:
-    axis.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda value, _: f"${value / 1_000_000:.1f}m")
-    )
+def layer_palette(layers: tuple[XoLLayer, ...]) -> dict[str, tuple[float, float, float]]:
+    """Return one colour per layer without assuming a fixed layer count."""
+
+    colours = sns.color_palette("colorblind", n_colors=len(layers))
+    return {layer.name: colour for layer, colour in zip(layers, colours, strict=True)}
 
 
-def save_figures(
-    claims: pd.DataFrame,
+def save_figure(figure: plt.Figure, filename: str) -> None:
+    """Apply consistent spacing, save a figure and close it."""
+
+    figure.tight_layout()
+    figure.savefig(FIGURE_DIR / filename, dpi=180, bbox_inches="tight")
+    plt.close(figure)
+
+
+def plot_claim_severity(claims: pd.DataFrame) -> None:
+    figure, axis = plt.subplots(figsize=(9, 5))
+    severities = claims["Claim"].to_numpy()
+    log_bins = np.geomspace(severities.min(), severities.max(), 60)
+    sns.histplot(severities, bins=log_bins, color="#24557a", ax=axis)
+    axis.set_xscale("log")
+    axis.set_title("Historical claim severity distribution")
+    axis.set_xlabel("Claim amount (log scale)")
+    axis.set_ylabel("Number of claims")
+    save_figure(figure, "claim_severity_distribution.png")
+
+
+def plot_historical_recovery(
     burning_costs: pd.DataFrame,
-    pricing: pd.DataFrame,
-    simulated_recoveries: dict[str, np.ndarray],
-    sensitivity: pd.DataFrame,
-    figure_dir: Path,
+    layers: tuple[XoLLayer, ...],
 ) -> None:
-    sns.set_theme(style="whitegrid", context="notebook")
-    colours = ["#24557a", "#4f8f8b", "#d4934c"]
-
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.hist(np.log10(claims["Claim"]), bins=45, color=colours[0], edgecolor="white")
-    for layer, colour in zip(DEFAULT_LAYERS, colours):
-        ax.axvline(np.log10(layer.attachment), color=colour, linestyle="--", linewidth=2,
-                   label=f"{layer.name} attachment")
-    ticks = np.arange(2, 8)
-    ax.set_xticks(ticks, [f"${10**tick:,.0f}" for tick in ticks])
-    ax.set_title("Historical claim severity and selected attachment points")
-    ax.set_xlabel("Claim amount (log scale)")
-    ax.set_ylabel("Number of claims")
-    ax.legend(frameon=True)
-    fig.tight_layout()
-    fig.savefig(figure_dir / "claim_severity_distribution.png", dpi=180)
-    plt.close(fig)
-
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    sns.barplot(
+    figure, axis = plt.subplots(figsize=(9, 5))
+    sns.lineplot(
         data=burning_costs,
         x="Year",
         y="2010 Exposure-Adjusted Recovery",
         hue="Layer",
-        palette=colours,
-        ax=ax,
+        marker="o",
+        palette=layer_palette(layers),
+        ax=axis,
     )
-    currency_axis(ax)
-    ax.set_title("Exposure-adjusted historical recovery by year")
-    ax.set_xlabel("")
-    ax.set_ylabel("Reinsurance recovery")
-    ax.legend(title="Layer")
-    fig.tight_layout()
-    fig.savefig(figure_dir / "historical_recovery_by_year.png", dpi=180)
-    plt.close(fig)
+    axis.set_title("Historical exposure-adjusted layer recovery")
+    axis.set_ylabel("Annual recovery ($)")
+    years = sorted(burning_costs["Year"].unique())
+    axis.set_xticks(years, labels=[str(int(year)) for year in years])
+    axis.ticklabel_format(style="plain", axis="y")
+    save_figure(figure, "historical_recovery_by_year.png")
 
-    long_simulation = pd.DataFrame(simulated_recoveries).melt(
-        var_name="Layer", value_name="Annual Recovery"
-    )
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    sns.boxplot(
-        data=long_simulation,
-        x="Layer",
-        y="Annual Recovery",
-        hue="Layer",
-        palette=colours,
-        showfliers=False,
-        legend=False,
-        ax=ax,
-    )
-    currency_axis(ax)
-    ax.set_title(f"Simulated annual recoveries ({SIMULATIONS:,} simulations)")
-    ax.set_xlabel("")
-    ax.set_ylabel("Annual recovery")
-    fig.tight_layout()
-    fig.savefig(figure_dir / "simulated_recovery_distribution.png", dpi=180)
-    plt.close(fig)
 
-    comparison = pricing.melt(
+def plot_simulated_recovery(
+    simulated_recoveries: dict[str, np.ndarray],
+    layers: tuple[XoLLayer, ...],
+) -> None:
+    figure, axis = plt.subplots(figsize=(9, 5))
+    colours = layer_palette(layers)
+    for layer in layers:
+        sns.kdeplot(
+            simulated_recoveries[layer.name],
+            label=layer.name,
+            color=colours[layer.name],
+            fill=False,
+            ax=axis,
+        )
+    axis.set_title("Simulated annual recovery distribution")
+    axis.set_xlabel("Annual recovery ($)")
+    axis.set_ylabel("Density")
+    axis.ticklabel_format(style="plain", axis="x")
+    axis.legend(title="Layer")
+    save_figure(figure, "simulated_recovery_distribution.png")
+
+
+def plot_pricing_comparison(
+    pricing: pd.DataFrame,
+    layers: tuple[XoLLayer, ...],
+) -> None:
+    long = pricing.melt(
         id_vars="Layer",
         value_vars=[
             "Historical Burning Cost",
@@ -108,103 +127,197 @@ def save_figures(
         var_name="Measure",
         value_name="Amount",
     )
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    sns.barplot(data=comparison, x="Layer", y="Amount", hue="Measure", ax=ax)
-    currency_axis(ax)
-    ax.set_title("Burning cost, expected recovery and technical premium")
-    ax.set_xlabel("")
-    ax.set_ylabel("Annual amount")
-    ax.legend(title="")
-    fig.tight_layout()
-    fig.savefig(figure_dir / "layer_pricing_comparison.png", dpi=180)
-    plt.close(fig)
-
-    pivot = sensitivity.pivot(
-        index="Attachment", columns="Limit", values="Technical Premium"
-    ) / 1_000_000
-    pivot.index = [f"${value / 1_000:,.0f}k" for value in pivot.index]
-    pivot.columns = [f"${value / 1_000:,.0f}k" for value in pivot.columns]
-    fig, ax = plt.subplots(figsize=(8, 5.5))
-    sns.heatmap(pivot, annot=True, fmt=".2f", cmap="Blues", cbar_kws={"label": "$m"}, ax=ax)
-    ax.set_title("Technical premium sensitivity ($m)")
-    ax.set_xlabel("Layer limit")
-    ax.set_ylabel("Attachment")
-    fig.tight_layout()
-    fig.savefig(figure_dir / "premium_sensitivity_heatmap.png", dpi=180)
-    plt.close(fig)
-
-    deductible_status = np.select(
-        [claims["Claim"] < claims["Deduct"], claims["Claim"] == claims["Deduct"]],
-        ["Below deductible", "Equal to deductible"],
-        default="Above deductible",
+    figure, axis = plt.subplots(figsize=(10, 5.5))
+    sns.barplot(
+        data=long,
+        x="Layer",
+        y="Amount",
+        hue="Measure",
+        order=[layer.name for layer in layers],
+        palette="Blues_d",
+        ax=axis,
     )
-    deductible_counts = pd.Series(deductible_status).value_counts().reindex(
-        ["Below deductible", "Equal to deductible", "Above deductible"]
+    axis.set_title("Burning cost, expected recovery and technical premium")
+    axis.set_xlabel("")
+    axis.set_ylabel("Amount ($)")
+    axis.ticklabel_format(style="plain", axis="y")
+    save_figure(figure, "layer_pricing_comparison.png")
+
+
+def plot_sensitivity(sensitivity: pd.DataFrame) -> None:
+    matrix = sensitivity.pivot(
+        index="Attachment",
+        columns="Limit",
+        values="Technical Premium",
+    ).sort_index(ascending=False)
+    figure, axis = plt.subplots(figsize=(9, 5.5))
+    sns.heatmap(
+        matrix / 1_000_000,
+        annot=True,
+        fmt=".2f",
+        cmap="Blues",
+        cbar_kws={"label": "Technical premium ($m)"},
+        ax=axis,
     )
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(deductible_counts.index, deductible_counts.values, color=colours)
-    ax.bar_label(bars, labels=[f"{v:,}" for v in deductible_counts.values], padding=3)
-    ax.set_title("Recorded claims compared with policy deductibles")
-    ax.set_ylabel("Number of claims")
-    ax.set_ylim(0, deductible_counts.max() * 1.15)
-    fig.tight_layout()
-    fig.savefig(figure_dir / "deductible_diagnostic.png", dpi=180)
-    plt.close(fig)
+    axis.set_title("Technical premium sensitivity")
+    axis.set_xlabel("Layer limit ($)")
+    axis.set_ylabel("Attachment ($)")
+    save_figure(figure, "premium_sensitivity_heatmap.png")
+
+
+def plot_deductible_diagnostic(claims: pd.DataFrame) -> None:
+    below = int((claims["Claim"] < claims["Deduct"]).sum())
+    at_or_above = int(len(claims) - below)
+    figure, axis = plt.subplots(figsize=(7, 4.5))
+    sns.barplot(
+        x=["Below listed deductible", "At or above deductible"],
+        y=[below, at_or_above],
+        hue=["Below listed deductible", "At or above deductible"],
+        palette=["#d4934c", "#24557a"],
+        legend=False,
+        ax=axis,
+    )
+    axis.set_title("Claim amount compared with listed deductible")
+    axis.set_xlabel("")
+    axis.set_ylabel("Number of records")
+    save_figure(figure, "deductible_diagnostic.png")
+
+
+def plot_tail_diagnostic(model: SeverityModel) -> None:
+    excesses = np.sort(model.tail_excesses)
+    empirical_survival = (len(excesses) - np.arange(len(excesses))) / (
+        len(excesses) + 1
+    )
+    fitted_excesses = np.geomspace(max(float(excesses.min()), 1.0), excesses.max(), 250)
+    fitted_survival = genpareto.sf(
+        fitted_excesses,
+        model.shape,
+        loc=0,
+        scale=model.scale,
+    )
+
+    figure, axis = plt.subplots(figsize=(8, 5))
+    axis.scatter(
+        model.threshold + excesses,
+        empirical_survival,
+        s=15,
+        alpha=0.65,
+        color="#24557a",
+        label="Historical exceedances",
+    )
+    axis.plot(
+        model.threshold + fitted_excesses,
+        fitted_survival,
+        color="#d4934c",
+        linewidth=2,
+        label="Fitted GPD tail",
+    )
+    axis.set_xscale("log")
+    axis.set_yscale("log")
+    axis.set_title(
+        f"Severity tail fit above ${model.threshold:,.0f} "
+        f"({model.exceedance_count} exceedances)"
+    )
+    axis.set_xlabel("Claim amount ($, log scale)")
+    axis.set_ylabel("Conditional survival probability (log scale)")
+    axis.legend()
+    save_figure(figure, "severity_tail_diagnostic.png")
+
+
+def save_figures(
+    claims: pd.DataFrame,
+    burning_costs: pd.DataFrame,
+    simulated_recoveries: dict[str, np.ndarray],
+    pricing: pd.DataFrame,
+    sensitivity: pd.DataFrame,
+    severity_model: SeverityModel,
+) -> None:
+    """Create the project figures using one focused function per chart."""
+
+    plot_claim_severity(claims)
+    plot_historical_recovery(burning_costs, DEFAULT_LAYERS)
+    plot_simulated_recovery(simulated_recoveries, DEFAULT_LAYERS)
+    plot_pricing_comparison(pricing, DEFAULT_LAYERS)
+    plot_sensitivity(sensitivity)
+    plot_deductible_diagnostic(claims)
+    plot_tail_diagnostic(severity_model)
 
 
 def main() -> None:
-    project_dir = Path(__file__).resolve().parent
-    data_dir = project_dir / "data"
-    table_dir = project_dir / "outputs" / "tables"
-    figure_dir = project_dir / "outputs" / "figures"
-    table_dir.mkdir(parents=True, exist_ok=True)
-    figure_dir.mkdir(parents=True, exist_ok=True)
+    """Fit the models, run the simulations and write reproducible outputs."""
 
-    claims, policies = load_data(data_dir)
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    TABLE_DIR.mkdir(parents=True, exist_ok=True)
+    sns.set_theme(style="whitegrid", context="notebook")
+
+    claims, policies = load_data(DATA_DIR)
     validate_data(claims, policies)
-
     frequency_model = fit_frequency_model(policies)
-    rng = np.random.default_rng(SEED)
-    claim_counts = simulate_annual_claim_counts(frequency_model, SIMULATIONS, rng)
-    simulated_recoveries = simulate_annual_recoveries(
-        claim_counts,
+    severity_model = fit_severity_model(
         claims["Claim"].to_numpy(),
-        DEFAULT_LAYERS,
-        rng,
+        threshold_quantile=TAIL_THRESHOLD_QUANTILE,
     )
+
+    sensitivity_layers = tuple(
+        XoLLayer(limit=limit, attachment=attachment)
+        for attachment in SENSITIVITY_ATTACHMENTS
+        for limit in SENSITIVITY_LIMITS
+    )
+    all_layers = tuple(dict.fromkeys((*DEFAULT_LAYERS, *sensitivity_layers)))
+
+    rng = np.random.default_rng(SEED)
+    claim_counts = simulate_annual_claim_counts(
+        frequency_model,
+        SIMULATIONS,
+        rng,
+        batch_size=BATCH_SIZE,
+    )
+    all_recoveries = simulate_annual_recoveries(
+        claim_counts,
+        severity_model,
+        all_layers,
+        rng,
+        batch_size=BATCH_SIZE,
+    )
+    selected_recoveries = {
+        layer.name: all_recoveries[layer.name] for layer in DEFAULT_LAYERS
+    }
 
     burning_costs = historical_burning_costs(claims, policies, DEFAULT_LAYERS)
     pricing = summarise_pricing(
-        simulated_recoveries,
+        selected_recoveries,
         claims,
         frequency_model["expected_annual_claims"],
+        severity_model,
         burning_costs,
         DEFAULT_LAYERS,
-        PREMIUM_LOADING,
+        expense_loading=EXPENSE_LOADING,
+        volatility_factor=VOLATILITY_FACTOR,
     )
     sensitivity = sensitivity_table(
-        claims,
-        frequency_model["expected_annual_claims"],
-        attachments=(50_000, 100_000, 250_000, 500_000),
-        limits=(100_000, 250_000, 500_000, 1_000_000),
-        loading=PREMIUM_LOADING,
+        all_recoveries,
+        sensitivity_layers,
+        expense_loading=EXPENSE_LOADING,
+        volatility_factor=VOLATILITY_FACTOR,
     )
 
     data_summary = pd.DataFrame(
         {
             "Metric": [
-                "Claims",
-                "Policy-years",
+                "Claim records",
+                "Policy-year records",
                 "Mean claim",
                 "Median claim",
                 "Maximum claim",
-                "Mean policy-year frequency",
-                "Sample variance of frequency",
                 "Zero-claim policy-years",
-                "Claims below listed deductible",
-                "Expected 2010-base annual claims",
+                "Expected annual claims (2010 portfolio)",
                 "Frequency dispersion",
-                "Monte Carlo simulations",
+                "Severity tail threshold",
+                "Severity tail exceedances",
+                "GPD shape",
+                "GPD scale",
+                "Simulation seed",
+                "Simulation batch size",
             ],
             "Value": [
                 len(claims),
@@ -212,36 +325,49 @@ def main() -> None:
                 claims["Claim"].mean(),
                 claims["Claim"].median(),
                 claims["Claim"].max(),
-                policies["Freq"].mean(),
-                policies["Freq"].var(ddof=1),
-                (policies["Freq"] == 0).mean(),
-                (claims["Claim"] < claims["Deduct"]).mean(),
+                int((policies["Freq"] == 0).sum()),
                 frequency_model["expected_annual_claims"],
                 frequency_model["dispersion"],
-                SIMULATIONS,
+                severity_model.threshold,
+                severity_model.exceedance_count,
+                severity_model.shape,
+                severity_model.scale,
+                SEED,
+                BATCH_SIZE,
             ],
         }
     )
-
-    pricing.to_csv(table_dir / "layer_pricing_results.csv", index=False)
-    burning_costs.to_csv(table_dir / "annual_burning_costs.csv", index=False)
-    sensitivity.to_csv(table_dir / "premium_sensitivity.csv", index=False)
-    data_summary.to_csv(table_dir / "data_summary.csv", index=False)
-    pd.DataFrame({"Simulated Claim Count": claim_counts, **simulated_recoveries}).to_csv(
-        table_dir / "simulation_results.csv", index=False
+    tail_summary = pd.DataFrame(
+        [
+            {
+                "Threshold Quantile": severity_model.threshold_quantile,
+                "Threshold": severity_model.threshold,
+                "Tail Probability": severity_model.tail_probability,
+                "Exceedance Count": severity_model.exceedance_count,
+                "GPD Shape": severity_model.shape,
+                "GPD Scale": severity_model.scale,
+                "Historical Maximum": severity_model.historical_maximum,
+            }
+        ]
     )
+
+    burning_costs.to_csv(TABLE_DIR / "annual_burning_costs.csv", index=False)
+    data_summary.to_csv(TABLE_DIR / "data_summary.csv", index=False)
+    pricing.to_csv(TABLE_DIR / "layer_pricing_results.csv", index=False)
+    sensitivity.to_csv(TABLE_DIR / "premium_sensitivity.csv", index=False)
+    tail_summary.to_csv(TABLE_DIR / "tail_model_summary.csv", index=False)
 
     save_figures(
         claims,
         burning_costs,
+        selected_recoveries,
         pricing,
-        simulated_recoveries,
         sensitivity,
-        figure_dir,
+        severity_model,
     )
 
-    print(f"Completed {SIMULATIONS:,} simulations with seed {SEED}.")
-    print(pricing[["Layer", "Historical Burning Cost", "Simulated Expected Recovery", "Technical Premium"]].to_string(index=False))
+    print("Analysis complete.")
+    print(pricing[["Layer", "Simulated Expected Recovery", "Technical Premium"]])
 
 
 if __name__ == "__main__":
