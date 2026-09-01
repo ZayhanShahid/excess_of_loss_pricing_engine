@@ -1,0 +1,13 @@
+Metric,Value
+Claims,6258.0
+Policy-years,5639.0
+Mean claim,15585.90369926494
+Median claim,1837.0
+Maximum claim,12922217.84
+Mean policy-year frequency,1.1092392268132647
+Sample variance of frequency,73.08845488405161
+Zero-claim policy-years,0.7022521723709878
+Claims below listed deductible,0.4490252476829658
+Expected 2010-base annual claims,1362.080555930984
+Frequency dispersion,5.269811953606118
+Monte Carlo simulations,10000.0
